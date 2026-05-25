@@ -142,13 +142,21 @@ export default function TrialDetail() {
       back={() => navigate('/')}
       title={trial.name}
       actions={
-        <div className="flex gap-2">
+        <div className="flex gap-1.5">
+          <button onClick={() => navigate(`/trial/${id}/map`)}
+            className="text-xs bg-white/20 hover:bg-white/30 px-2.5 py-1.5 rounded-full font-medium">
+            Map
+          </button>
+          <button onClick={() => navigate(`/trial/${id}/analysis`)}
+            className="text-xs bg-white/20 hover:bg-white/30 px-2.5 py-1.5 rounded-full font-medium">
+            Analysis
+          </button>
           <button onClick={() => navigate(`/trial/${id}/traits`)}
-            className="text-xs bg-white/20 hover:bg-white/30 px-3 py-1.5 rounded-full font-medium">
+            className="text-xs bg-white/20 hover:bg-white/30 px-2.5 py-1.5 rounded-full font-medium">
             Traits
           </button>
           <button onClick={() => navigate(`/trial/${id}/export`)}
-            className="text-xs bg-white/20 hover:bg-white/30 px-3 py-1.5 rounded-full font-medium">
+            className="text-xs bg-white/20 hover:bg-white/30 px-2.5 py-1.5 rounded-full font-medium">
             Export
           </button>
         </div>
