@@ -116,7 +116,15 @@ export default function TrialDetail() {
     const plotIds = plots.map(p => p.id)
     db.observations.where('plot_id').anyOf(plotIds).toArray().then(obs => {
       const counts = {}
-      obs.forEach(o => { counts[o.plot_id] = (counts[o.plot_id] || 0) + 1 })
+      // Count distinct traits recorded, not rows — a trait measured on several
+      // dates is still one trait covered.
+      const seen = new Set()
+      obs.forEach(o => {
+        const k = `${o.plot_id}:${o.trait_id}`
+        if (seen.has(k)) return
+        seen.add(k)
+        counts[o.plot_id] = (counts[o.plot_id] || 0) + 1
+      })
       setObsCount(counts)
     })
   }, [plots])
@@ -177,8 +185,8 @@ export default function TrialDetail() {
         {/* Collect all button */}
         {trialPlots.length > 0 && totalTraits > 0 && (
           <button
-            onClick={() => navigate(`/collect/${id}/0/0`)}
-            className="w-full bg-green-600 text-white py-3.5 rounded-2xl font-semibold text-base shadow-sm flex items-center justify-center gap-2"
+            onClick={() => navigate(`/trial/${id}/record`)}
+            className="w-full bg-green-600 text-white py-4 rounded-2xl font-bold text-lg shadow-sm flex items-center justify-center gap-2 active:bg-green-700"
           >
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />

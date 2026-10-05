@@ -20,7 +20,8 @@ async function buildRows(trialId) {
     const plot = plotMap[obs.plot_id]
     const trait = traitMap[obs.trait_id]
     return {
-      unique_id: `${trial.name}_${plot?.name}_${trait?.name}`,
+      // Date is part of the key — the same trait can be measured on several dates.
+      unique_id: `${trial.name}_${plot?.name}_${trait?.name}_${obs.observed_on}`,
       trial: trial.name,
       variety: plot?.variety ?? '',
       rep: plot?.rep ?? '',
@@ -29,6 +30,11 @@ async function buildRows(trialId) {
       format: trait?.format ?? '',
       unit: trait?.unit ?? '',
       value: obs.value,
+      // Individual plant readings are preserved so the mean can be recomputed
+      // or re-analysed later; blank for plot-level traits.
+      n_plants: obs.readings?.length ?? '',
+      readings: obs.readings?.join(' ') ?? '',
+      status: obs.status ?? 'recorded',
       observed_on: obs.observed_on,
       lat: plot?.lat ?? '',
       lng: plot?.lng ?? '',
@@ -45,11 +51,11 @@ async function buildSummaryMatrix(trialId) {
   const traitsList = await db.traits.where('id').anyOf(traitIds).toArray()
   const traitMap = Object.fromEntries(traitsList.map(t => [t.id, t]))
 
+  // Oldest first so the latest reading wins in the summary matrix.
   const obsIndex = {}
-  observations.forEach(o => {
-    const key = `${o.plot_id}_${o.trait_id}`
-    obsIndex[key] = o.value
-  })
+  ;[...observations]
+    .sort((a, b) => (a.observed_on ?? '').localeCompare(b.observed_on ?? ''))
+    .forEach(o => { obsIndex[`${o.plot_id}_${o.trait_id}`] = o.value })
 
   const header = ['Plot', 'Variety', 'Rep', ...traitsList.map(t => t.name)]
   const rows = plots.map(plot => [

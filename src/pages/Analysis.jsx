@@ -76,7 +76,9 @@ export default function Analysis() {
   const plotObsMap = useMemo(() => {
     const traitById = Object.fromEntries(allTraits.map(t => [t.id, t]))
     const map = {}
-    allObs.forEach(o => {
+    // Oldest first, so a trait measured several times leaves the latest value.
+    const ordered = [...allObs].sort((a, b) => (a.observed_on ?? '').localeCompare(b.observed_on ?? ''))
+    ordered.forEach(o => {
       const trait = traitById[o.trait_id]
       if (!trait) return
       if (!map[o.plot_id]) map[o.plot_id] = {}

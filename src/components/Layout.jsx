@@ -1,6 +1,10 @@
 import NavBar from './NavBar'
 
-export default function Layout({ children, title, back, actions }) {
+/**
+ * hideNav — for focused task flows (choosing a session, collecting) the tab bar
+ * is noise and collides with the screen's own bottom action button.
+ */
+export default function Layout({ children, title, back, actions, hideNav = false }) {
   return (
     <div className="flex flex-col min-h-svh bg-gray-50">
       <header className="sticky top-0 z-30 bg-green-700 text-white shadow-md safe-top">
@@ -17,11 +21,11 @@ export default function Layout({ children, title, back, actions }) {
         </div>
       </header>
 
-      <main className="flex-1 pb-20">
+      <main className={`flex-1 ${hideNav ? '' : 'pb-20'}`}>
         {children}
       </main>
 
-      <NavBar />
+      {!hideNav && <NavBar />}
     </div>
   )
 }

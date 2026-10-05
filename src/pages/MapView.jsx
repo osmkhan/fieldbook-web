@@ -31,7 +31,13 @@ export default function MapView() {
     const plotIds = plots.filter(p => p.trial_id === tid).map(p => p.id)
     db.observations.where('plot_id').anyOf(plotIds).toArray().then(obs => {
       const counts = {}
-      obs.forEach(o => { counts[o.plot_id] = (counts[o.plot_id] || 0) + 1 })
+      const seen = new Set()
+      obs.forEach(o => {
+        const k = `${o.plot_id}:${o.trait_id}`
+        if (seen.has(k)) return
+        seen.add(k)
+        counts[o.plot_id] = (counts[o.plot_id] || 0) + 1
+      })
       setObsCount(counts)
     })
   }, [plots, tid])

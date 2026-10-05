@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { db, resetAndSeed } from '../db/index'
+import { db, resetAndSeed, today } from '../db/index'
 
 export const useStore = create((set, get) => ({
   trials: [],
@@ -96,25 +96,47 @@ export const useStore = create((set, get) => ({
     set({ observations })
     return observations
   },
-  upsertObservation: async (plot_id, trait_id, value, notes = '') => {
+  /**
+   * Save one observation. Keyed by (plot, trait, DATE) — recording the same trait
+   * on a later date creates a new row rather than destroying the earlier reading,
+   * so repeated measurements through the season build a history.
+   *
+   * value    — the number/text stored (for per-plant traits this is the mean)
+   * readings — individual plant measurements, kept verbatim; null for plot-level traits
+   * status   — 'recorded' | 'na'  ('na' = checked, genuinely not available)
+   */
+  saveObservation: async ({ plot_id, trait_id, value, readings = null, status = 'recorded', notes = '', date }) => {
+    const on = date ?? today()
     const existing = await db.observations
-      .where('[plot_id+trait_id]').equals([plot_id, trait_id])
+      .where('[plot_id+trait_id+observed_on]').equals([plot_id, trait_id, on])
       .first()
-    const today = new Date().toISOString().split('T')[0]
+
+    const isEmpty = status === 'recorded' && (value === '' || value == null) &&
+                    (!readings || readings.length === 0)
+
+    // Clearing a value deletes the row rather than storing a blank observation.
+    if (isEmpty) {
+      if (existing) await db.observations.delete(existing.id)
+      set(s => ({ observations: s.observations.filter(o => o.id !== existing?.id) }))
+      return null
+    }
+
+    const row = { plot_id, trait_id, value: String(value ?? ''), readings, status, notes, observed_on: on }
     let obs
     if (existing) {
-      await db.observations.update(existing.id, { value, notes, observed_on: today })
-      obs = { ...existing, value, notes, observed_on: today }
+      await db.observations.update(existing.id, row)
+      obs = { ...existing, ...row }
     } else {
-      const id = await db.observations.add({ plot_id, trait_id, value, notes, observed_on: today })
+      const id = await db.observations.add(row)
       obs = await db.observations.get(id)
     }
-    set(s => {
-      const filtered = s.observations.filter(o => !(o.plot_id === plot_id && o.trait_id === trait_id))
-      return { observations: [...filtered, obs] }
-    })
+    set(s => ({ observations: [...s.observations.filter(o => o.id !== obs.id), obs] }))
     return obs
   },
+
+  // Back-compat wrapper for the plot-detail edit path.
+  upsertObservation: async (plot_id, trait_id, value, notes = '') =>
+    get().saveObservation({ plot_id, trait_id, value, notes }),
 
   // Weather notes
   loadWeatherNotes: async (trial_id) => {

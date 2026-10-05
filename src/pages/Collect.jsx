@@ -1,205 +1,347 @@
-import { useState, useEffect, useCallback } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useEffect, useMemo, useState, useCallback } from 'react'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { useStore } from '../store/useStore'
-import TraitInput from '../components/TraitInput'
+import { db, today, meanOf } from '../db/index'
 
+/**
+ * Collect — one plot at a time, showing only the traits chosen for this session.
+ *
+ * Navigation is plot-major: the trait set is fixed for the session, so the only
+ * movement is between plots. Everything autosaves to IndexedDB on change.
+ */
 export default function Collect() {
-  // trialId, startPlotId (0 = first), startTraitIdx
-  const { trialId, plotId: startPlotIdStr, traitIdx: startTraitStr } = useParams()
+  const { trialId } = useParams()
+  const [params] = useSearchParams()
   const navigate = useNavigate()
+  const { trials, plots, traits, loadPlots } = useStore()
 
-  const { trials, plots, traits, observations, loadPlots, loadObservations,
-          loadAllObservations, loadTrialTraits, trialTraits, upsertObservation } = useStore()
+  const tid = parseInt(trialId)
+  const trial = trials.find(t => t.id === tid)
+  const traitIds = (params.get('traits') ?? '').split(',').filter(Boolean).map(Number)
 
   const [plotIdx, setPlotIdx] = useState(0)
-  const [traitIdx, setTraitIdx] = useState(parseInt(startTraitStr) || 0)
-  const [value, setValue] = useState('')
-  const [saving, setSaving] = useState(false)
-  const [saved, setSaved] = useState(false)
+  const [values, setValues] = useState({})     // traitId -> { value, readings, status }
+  const [previous, setPrevious] = useState({}) // traitId -> last observation from an earlier date
+  const [doneCount, setDoneCount] = useState(0)
 
-  const trial = trials.find(t => t.id === parseInt(trialId))
-  const trialPlots = plots.filter(p => p.trial_id === parseInt(trialId))
-  const activeTraits = traits.filter(t => trialTraits.includes(t.id))
+  useEffect(() => { loadPlots(tid) }, [tid])
 
+  const trialPlots = useMemo(
+    () => plots.filter(p => p.trial_id === tid)
+               .sort((a, b) => (a.sort_order ?? a.id) - (b.sort_order ?? b.id)),
+    [plots, tid]
+  )
+  const sessionTraits = useMemo(
+    () => traitIds.map(id => traits.find(t => t.id === id)).filter(Boolean),
+    [traits, params.get('traits')]
+  )
+  const plot = trialPlots[plotIdx]
+
+  // Load today's values + the most recent earlier reading for context.
   useEffect(() => {
-    const tid = parseInt(trialId)
-    loadPlots(tid).then(ps => {
-      loadAllObservations(tid)
-      loadTrialTraits(tid)
-      if (startPlotIdStr && startPlotIdStr !== '0') {
-        const idx = ps.findIndex(p => p.id === parseInt(startPlotIdStr))
-        if (idx >= 0) setPlotIdx(idx)
+    if (!plot) return
+    let cancelled = false
+    ;(async () => {
+      const rows = await db.observations.where('plot_id').equals(plot.id).toArray()
+      if (cancelled) return
+      const t = today()
+      const cur = {}, prev = {}
+      for (const id of traitIds) {
+        const mine = rows.filter(r => r.trait_id === id)
+        const todays = mine.find(r => r.observed_on === t)
+        if (todays) cur[id] = { value: todays.value, readings: todays.readings, status: todays.status }
+        const earlier = mine.filter(r => r.observed_on !== t).sort((a, b) => b.observed_on.localeCompare(a.observed_on))[0]
+        if (earlier) prev[id] = earlier
       }
+      setValues(cur)
+      setPrevious(prev)
+    })()
+    return () => { cancelled = true }
+  }, [plot?.id, params.get('traits')])
+
+  // How many plots have at least one of this session's traits recorded today.
+  const refreshProgress = useCallback(async () => {
+    if (!trialPlots.length) return
+    const ids = trialPlots.map(p => p.id)
+    const rows = await db.observations.where('plot_id').anyOf(ids).toArray()
+    const t = today()
+    const hit = new Set(
+      rows.filter(r => r.observed_on === t && traitIds.includes(r.trait_id)).map(r => r.plot_id)
+    )
+    setDoneCount(hit.size)
+  }, [trialPlots, params.get('traits')])
+
+  useEffect(() => { refreshProgress() }, [refreshProgress, plotIdx])
+
+  const save = useCallback(async (trait, patch) => {
+    const next = { ...(values[trait.id] ?? {}), ...patch }
+    setValues(v => ({ ...v, [trait.id]: next }))
+    const value = trait.per_plant && next.readings?.length
+      ? String(meanOf(next.readings) ?? '')
+      : (next.value ?? '')
+    await useStore.getState().saveObservation({
+      plot_id: plot.id,
+      trait_id: trait.id,
+      value,
+      readings: trait.per_plant ? (next.readings ?? null) : null,
+      status: next.status ?? 'recorded',
     })
-  }, [trialId])
+    refreshProgress()
+  }, [values, plot?.id, refreshProgress])
 
-  const currentPlot = trialPlots[plotIdx]
-  const currentTrait = activeTraits[traitIdx]
+  if (!trial)              return <Shell onBack={() => navigate('/')} msg="Trial not found." />
+  if (!sessionTraits.length) return <Shell onBack={() => navigate(`/trial/${trialId}/record`)} msg="No traits selected for this session." />
+  if (!plot)               return <Shell onBack={() => navigate(`/trial/${trialId}`)} msg="No plots in this trial yet." />
 
-  // Load current value whenever plot/trait changes
-  useEffect(() => {
-    if (!currentPlot || !currentTrait) return
-    const obs = observations.find(o => o.plot_id === currentPlot.id && o.trait_id === currentTrait.id)
-    setValue(obs?.value ?? '')
-    setSaved(false)
-  }, [plotIdx, traitIdx, currentPlot?.id, currentTrait?.id])
+  const isLast = plotIdx === trialPlots.length - 1
+  const pct = trialPlots.length ? Math.round((doneCount / trialPlots.length) * 100) : 0
 
-  const save = useCallback(async (val) => {
-    if (!currentPlot || !currentTrait) return
-    setSaving(true)
-    await upsertObservation(currentPlot.id, currentTrait.id, val ?? value)
-    setSaving(false)
-    setSaved(true)
-    setTimeout(() => setSaved(false), 1500)
-  }, [currentPlot, currentTrait, value])
+  return (
+    <div className="min-h-[100svh] flex flex-col bg-gray-50">
+      {/* Header — plot identity is the biggest thing on screen */}
+      <header className="bg-green-800 text-white px-4 pt-3 pb-3 sticky top-0 z-20">
+        <div className="flex items-start gap-3">
+          <button onClick={() => navigate(`/trial/${trialId}`)} aria-label="Back"
+            className="p-2 -ml-2 -mt-1 active:bg-white/20 rounded-lg">
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+            </svg>
+          </button>
+          <div className="flex-1 min-w-0">
+            <h1 className="text-3xl font-extrabold leading-tight truncate">{plot.name || `Plot ${plotIdx + 1}`}</h1>
+            <p className="text-sm text-green-100 truncate">
+              {plot.variety || 'No variety'}{plot.rep ? ` · Rep ${plot.rep}` : ''}
+            </p>
+          </div>
+          <div className="text-right shrink-0">
+            <div className="text-2xl font-bold tabular-nums">{plotIdx + 1}</div>
+            <div className="text-xs text-green-200">of {trialPlots.length}</div>
+          </div>
+        </div>
+        <div className="mt-3 h-1.5 bg-green-900/50 rounded-full overflow-hidden">
+          <div className="h-full bg-green-300 transition-all" style={{ width: `${pct}%` }} />
+        </div>
+        <p className="text-[11px] text-green-200 mt-1">{doneCount} of {trialPlots.length} plots done today</p>
+      </header>
 
-  const goNext = useCallback(async () => {
-    await save()
-    if (traitIdx < activeTraits.length - 1) {
-      setTraitIdx(t => t + 1)
-    } else if (plotIdx < trialPlots.length - 1) {
-      setPlotIdx(p => p + 1)
-      setTraitIdx(0)
-    } else {
-      navigate(`/trial/${trialId}`)
-    }
-  }, [traitIdx, plotIdx, activeTraits.length, trialPlots.length, save])
+      <main className="flex-1 overflow-y-auto px-3 py-3 space-y-3 pb-4">
+        {sessionTraits.map(trait => (
+          <TraitCard
+            key={trait.id}
+            trait={trait}
+            state={values[trait.id]}
+            previous={previous[trait.id]}
+            onChange={patch => save(trait, patch)}
+          />
+        ))}
+      </main>
 
-  const goPrev = useCallback(() => {
-    if (traitIdx > 0) {
-      setTraitIdx(t => t - 1)
-    } else if (plotIdx > 0) {
-      setPlotIdx(p => p - 1)
-      setTraitIdx(activeTraits.length - 1)
-    }
-  }, [traitIdx, plotIdx, activeTraits.length])
+      {/* Navigation — thumb zone */}
+      <footer className="sticky bottom-0 bg-white border-t border-gray-200 px-3 py-3 flex gap-3 safe-bottom">
+        <button
+          onClick={() => setPlotIdx(i => Math.max(0, i - 1))}
+          disabled={plotIdx === 0}
+          className="w-28 py-4 rounded-2xl bg-gray-100 disabled:opacity-40 text-gray-700 font-bold text-base active:bg-gray-200"
+        >
+          ← Back
+        </button>
+        <button
+          onClick={() => isLast ? navigate(`/trial/${trialId}`) : setPlotIdx(i => i + 1)}
+          className="flex-1 py-4 rounded-2xl bg-green-600 text-white font-bold text-lg active:bg-green-700"
+        >
+          {isLast ? 'Finish' : 'Next plot →'}
+        </button>
+      </footer>
+    </div>
+  )
+}
 
-  const handleKeyDown = useCallback((e) => {
-    if (e.key === 'Enter' && e.ctrlKey) goNext()
-  }, [goNext])
+function Shell({ onBack, msg }) {
+  return (
+    <div className="min-h-[100svh] bg-gray-50">
+      <header className="bg-green-800 text-white px-4 py-4 flex items-center gap-3">
+        <button onClick={onBack} className="p-1 -ml-1">
+          <svg className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+          </svg>
+        </button>
+        <h1 className="text-lg font-bold">Collect</h1>
+      </header>
+      <p className="p-6 text-gray-600">{msg}</p>
+    </div>
+  )
+}
 
-  useEffect(() => {
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [handleKeyDown])
+/* ------------------------------------------------------------------ */
 
-  if (!trial || activeTraits.length === 0 || trialPlots.length === 0) {
-    return (
-      <div className="min-h-svh bg-gray-900 text-white flex flex-col items-center justify-center p-6 text-center">
-        <p className="text-gray-400 mb-4">
-          {!activeTraits.length ? 'No active traits for this trial.' : 'No plots in this trial.'}
+function TraitCard({ trait, state, previous, onChange }) {
+  const isNA = state?.status === 'na'
+  const outOfRange =
+    trait.format === 'numeric' && state?.value !== '' && state?.value != null &&
+    ((trait.min != null && Number(state.value) < trait.min) ||
+     (trait.max != null && Number(state.value) > trait.max))
+
+  return (
+    <section className={`rounded-2xl border shadow-sm overflow-hidden ${isNA ? 'bg-gray-100 border-gray-200' : 'bg-white border-gray-200'}`}>
+      <div className="flex items-baseline gap-2 px-4 pt-3.5 pb-2">
+        <h2 className="text-lg font-bold text-gray-900 flex-1 leading-tight">{trait.name}</h2>
+        {trait.unit && <span className="text-sm text-gray-500 shrink-0">{trait.unit}</span>}
+      </div>
+
+      {previous && (
+        <p className="px-4 -mt-1 pb-2 text-xs text-amber-700">
+          Last time: <span className="font-semibold">{previous.status === 'na' ? 'NA' : previous.value}</span>
+          {' '}on {previous.observed_on}
         </p>
-        <button onClick={() => navigate(-1)}
-          className="bg-green-600 px-6 py-3 rounded-xl font-semibold">
-          Go Back
+      )}
+
+      {!isNA && (
+        <div className="px-4 pb-3">
+          {trait.per_plant
+            ? <ReadingsInput trait={trait} state={state} onChange={onChange} />
+            : <SingleInput   trait={trait} state={state} onChange={onChange} />}
+          {outOfRange && (
+            <p className="mt-2 text-xs text-red-600 font-medium">
+              Outside the usual range ({trait.min ?? '–'}–{trait.max ?? '–'} {trait.unit}). Saved anyway.
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className="flex items-center gap-2 px-4 py-2.5 border-t border-gray-100 bg-gray-50/70">
+        <button
+          onClick={() => onChange(isNA
+            ? { status: 'recorded' }
+            : { status: 'na', value: 'NA', readings: null })}
+          className={`px-4 py-2 rounded-xl text-sm font-bold ${
+            isNA ? 'bg-gray-700 text-white' : 'bg-white border-2 border-gray-300 text-gray-600 active:bg-gray-100'
+          }`}
+        >
+          {isNA ? 'NA — tap to undo' : 'NA'}
+        </button>
+        <span className="text-xs text-gray-400 flex-1 text-right">
+          {isNA ? 'Checked, not available' : 'Saves automatically'}
+        </span>
+      </div>
+    </section>
+  )
+}
+
+function SingleInput({ trait, state, onChange }) {
+  const v = state?.value ?? ''
+
+  if (trait.format === 'categorical') {
+    return (
+      <div className="flex flex-wrap gap-2">
+        {trait.categories.map(c => (
+          <button
+            key={c}
+            onClick={() => onChange({ value: v === c ? '' : c })}
+            className={`px-4 py-3 rounded-xl text-base font-semibold border-2 ${
+              v === c ? 'bg-green-600 border-green-600 text-white' : 'bg-white border-gray-300 text-gray-700 active:bg-gray-50'
+            }`}
+          >
+            {c}
+          </button>
+        ))}
+      </div>
+    )
+  }
+
+  if (trait.format === 'date') {
+    return (
+      <div className="flex gap-2">
+        <input
+          type="date" value={v}
+          onChange={e => onChange({ value: e.target.value })}
+          className="flex-1 border-2 border-gray-300 rounded-xl px-3 py-3 text-lg focus:border-green-600 outline-none"
+        />
+        <button
+          onClick={() => onChange({ value: today() })}
+          className="px-4 py-3 rounded-xl bg-green-600 text-white font-bold active:bg-green-700"
+        >
+          Today
         </button>
       </div>
     )
   }
 
-  const totalSteps = trialPlots.length * activeTraits.length
-  const currentStep = plotIdx * activeTraits.length + traitIdx + 1
-  const progressPct = Math.round((currentStep / totalSteps) * 100)
+  if (trait.format === 'text') {
+    return (
+      <textarea
+        rows={3} value={v}
+        onChange={e => onChange({ value: e.target.value })}
+        placeholder="Type here…"
+        className="w-full border-2 border-gray-300 rounded-xl px-3 py-3 text-base focus:border-green-600 outline-none"
+      />
+    )
+  }
 
-  const isFirst = plotIdx === 0 && traitIdx === 0
-  const isLast = plotIdx === trialPlots.length - 1 && traitIdx === activeTraits.length - 1
+  // numeric
+  return (
+    <input
+      type="number" inputMode="decimal" value={v}
+      onChange={e => onChange({ value: e.target.value })}
+      placeholder="—"
+      className="w-full border-2 border-gray-300 rounded-xl px-4 py-4 text-3xl font-bold tabular-nums text-center focus:border-green-600 outline-none"
+    />
+  )
+}
+
+/** Per-plant traits: keep every individual reading, show the running mean. */
+function ReadingsInput({ trait, state, onChange }) {
+  const readings = state?.readings ?? []
+  const [draft, setDraft] = useState('')
+
+  const add = () => {
+    const n = parseFloat(draft)
+    if (isNaN(n)) return
+    onChange({ readings: [...readings, n] })
+    setDraft('')
+  }
+  const remove = i => onChange({ readings: readings.filter((_, j) => j !== i) })
+
+  const mean = meanOf(readings)
 
   return (
-    <div className="min-h-svh bg-gray-900 text-white flex flex-col safe-top safe-bottom">
-      {/* Top bar */}
-      <div className="flex items-center gap-3 px-4 h-14 border-b border-white/10">
-        <button onClick={() => navigate(-1)} className="text-white/60 hover:text-white p-1 -ml-1">
-          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-          </svg>
-        </button>
-        <div className="flex-1">
-          <div className="text-xs text-white/50">
-            Plot {plotIdx + 1} of {trialPlots.length} · Trait {traitIdx + 1} of {activeTraits.length}
-          </div>
+    <div>
+      {readings.length > 0 && (
+        <div className="flex flex-wrap gap-2 mb-2.5">
+          {readings.map((r, i) => (
+            <button
+              key={i} onClick={() => remove(i)}
+              className="px-3 py-2 rounded-lg bg-green-50 border-2 border-green-200 text-green-900 font-bold tabular-nums text-base flex items-center gap-1.5 active:bg-green-100"
+            >
+              {r}
+              <span className="text-green-400 text-lg leading-none">×</span>
+            </button>
+          ))}
         </div>
-        <div className="text-xs font-medium text-green-400">{progressPct}%</div>
-      </div>
+      )}
 
-      {/* Progress bar */}
-      <div className="h-1 bg-white/10">
-        <div className="h-full bg-green-500 transition-all" style={{ width: `${progressPct}%` }} />
-      </div>
-
-      {/* Content */}
-      <div className="flex-1 flex flex-col px-5 py-6 overflow-y-auto">
-        {/* Plot info */}
-        <div className="mb-6">
-          <div className="text-white/50 text-xs uppercase tracking-wide mb-1">Plot</div>
-          <div className="text-xl font-bold">{currentPlot?.name}</div>
-          <div className="text-green-400 text-sm mt-0.5">{currentPlot?.variety}</div>
-        </div>
-
-        {/* Trait */}
-        <div className="mb-8">
-          <div className="text-white/50 text-xs uppercase tracking-wide mb-1">
-            {currentTrait?.stage?.replace('_', ' ')} · {currentTrait?.format}
-          </div>
-          <div className="text-2xl font-semibold mb-6">{currentTrait?.name}</div>
-          {currentTrait && (
-            <TraitInput
-              trait={currentTrait}
-              value={value}
-              onChange={(v) => { setValue(v); setSaved(false) }}
-            />
-          )}
-        </div>
-
-        {/* Saved indicator */}
-        {saved && (
-          <div className="flex items-center justify-center gap-2 text-green-400 text-sm mb-4">
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-            </svg>
-            Saved
-          </div>
-        )}
-      </div>
-
-      {/* Navigation buttons */}
-      <div className="px-4 pb-8 flex gap-3">
+      <div className="flex gap-2">
+        <input
+          type="number" inputMode="decimal" value={draft}
+          onChange={e => setDraft(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); add() } }}
+          placeholder={`Plant ${readings.length + 1}`}
+          className="flex-1 min-w-0 border-2 border-gray-300 rounded-xl px-3 py-3.5 text-2xl font-bold tabular-nums text-center focus:border-green-600 outline-none"
+        />
         <button
-          onClick={goPrev}
-          disabled={isFirst}
-          className="flex-none w-14 h-14 rounded-2xl border border-white/20 flex items-center justify-center disabled:opacity-30"
+          onClick={add} disabled={draft === ''}
+          className="w-16 shrink-0 rounded-xl bg-green-600 disabled:bg-gray-300 text-white text-3xl font-bold active:bg-green-700"
+          aria-label="Add reading"
         >
-          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-          </svg>
-        </button>
-
-        <button
-          onClick={() => save(value)}
-          className={`flex-none w-14 h-14 rounded-2xl border border-white/20 flex items-center justify-center transition-all ${
-            saving ? 'opacity-50' : ''
-          }`}
-        >
-          <svg className="w-6 h-6 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-          </svg>
-        </button>
-
-        <button
-          onClick={goNext}
-          className="flex-1 h-14 rounded-2xl bg-green-600 hover:bg-green-500 font-semibold text-base flex items-center justify-center gap-2"
-        >
-          {isLast ? (
-            <>Done</>
-          ) : (
-            <>
-              Next
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-              </svg>
-            </>
-          )}
+          +
         </button>
       </div>
+
+      <p className="mt-2 text-sm text-gray-600">
+        {readings.length === 0
+          ? <span className="text-gray-400">Measure a few plants and add each one.</span>
+          : <>Average <span className="font-bold text-gray-900 text-base">{mean}</span>
+             {trait.unit ? ` ${trait.unit}` : ''} · {readings.length} plant{readings.length === 1 ? '' : 's'}</>}
+      </p>
     </div>
   )
 }
